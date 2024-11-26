@@ -17,8 +17,16 @@ var (
 	ErrInvalidChunkSize = fmt.Errorf("chunk size must be positive")
 )
 
+// DatabaseType represents the type of database to connect to.
+type DatabaseType string
+
 // Default Configuration Values
 const (
+	// Supported Database Types
+	TypePostgres DatabaseType = "postgres"
+	TypeRedshift DatabaseType = "redshift"
+
+	// Default Configuration Values
 	defaultMaxOpenConns = 10
 	defaultMaxIdleConns = 5
 	defaultConnTimeout  = 30 * time.Second
@@ -30,6 +38,7 @@ const (
 // a connection with a Redshift database. It provides validation and
 // connection string generation capabilities.
 type Config struct {
+	Type         DatabaseType
 	Host         string
 	Port         int
 	User         string
@@ -39,6 +48,9 @@ type Config struct {
 	MaxOpenConns int
 	MaxIdleConns int
 	ConnTimeout  time.Duration // // Connection timeout duration
+
+	// Optional, Additional database-specific options can be added here
+	Options map[string]string
 }
 
 // NewDefaultConfig creates a new Config instance with default values.
@@ -50,20 +62,39 @@ type Config struct {
 // - MaxOpenConns: 10
 // - MaxIdleConns: 5
 // - ConnTimeout: 30 seconds
-func NewDefaultConfig() *Config {
-	return &Config{
+func NewDefaultConfig(dbType DatabaseType) *Config {
+	config := &Config{
+		Type:         dbType,
 		Port:         defaultPort,
 		SSLMode:      defaultSSLMode,
 		MaxOpenConns: defaultMaxOpenConns,
 		MaxIdleConns: defaultMaxIdleConns,
 		ConnTimeout:  defaultConnTimeout,
+		Options:      make(map[string]string),
 	}
+
+	switch dbType {
+	case TypeRedshift:
+		config.Port = 5439 // Default port for Redshift
+	default:
+		config.Port = 5432 // Default port for PostgreSQL
+
+	}
+	return config
 }
 
 // DNS generates a connection string in DNS format (i.e. postgres://user:pass@host:port/dbname?sslmode=mode)
 // from the given configuration.
 func (c *Config) DNS() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s", c.User, c.Password, c.Host, c.Port, c.Database, c.SSLMode)
+	baseUrl := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s", c.User, c.Password, c.Host, c.Port, c.Database, c.SSLMode)
+	// Add additional options
+	if len(c.Options) > 0 {
+		for key, value := range c.Options {
+			baseUrl += fmt.Sprintf("&%s=%s", key, value)
+		}
+	}
+	return baseUrl
+
 }
 
 // Validate checks if the configuration is valid.
@@ -76,18 +107,21 @@ func (c *Config) DNS() string {
 // - MaxOpenConns must be >= MaxIdleConns
 //
 // Returns an error if the configuration is invalid. Otherwise returns nil.
+// Validate checks if the configuration is valid
 func (c *Config) Validate() error {
 	switch {
+	case c.Type == "":
+		return fmt.Errorf("%v: database type must be specified", ErrInvalidConfig)
 	case c.Host == "":
-		return fmt.Errorf("%w: host cannot be empty", ErrInvalidConfig)
+		return fmt.Errorf("%v: host cannot be empty", ErrInvalidConfig)
 	case c.Port <= 0:
-		return fmt.Errorf("%w: invalid port number", ErrInvalidConfig)
+		return fmt.Errorf("%v: invalid port number", ErrInvalidConfig)
 	case c.User == "":
-		return fmt.Errorf("%w: user cannot be empty", ErrInvalidConfig)
+		return fmt.Errorf("%v: user cannot be empty", ErrInvalidConfig)
 	case c.Database == "":
-		return fmt.Errorf("%w: database cannot be empty", ErrInvalidConfig)
+		return fmt.Errorf("%v: database cannot be empty", ErrInvalidConfig)
 	case c.MaxOpenConns < c.MaxIdleConns:
-		return fmt.Errorf("%w: maxOpenConns must be >= maxIdleConns", ErrInvalidConfig)
+		return fmt.Errorf("%v: maxOpenConns must be >= maxIdleConns", ErrInvalidConfig)
 	}
 	return nil
 }
@@ -120,14 +154,23 @@ type DatabaseClient interface {
 	// establishing a connection if necessary. If the connection is alive,
 	// the method returns nil. Otherwise, an error is returned.
 	Ping(ctx context.Context) error
+
+	// Type returns the type of the database client
+	Type() DatabaseType
 }
 
 // RedshiftDatabaseClient implements the DatabaseClient interface for a Redshift database.
 // It provides methods to query the database, fetch chunks of data, close the connection
 // and ping the connection.
-type RedshiftDatabaseClient struct {
-	db     *sql.DB
-	logger *log.Logger
+type Client struct {
+	db         *sql.DB
+	logger     *log.Logger
+	dbType     DatabaseType
+	statements map[string]*sql.Stmt // Map to store prepared statements
+}
+
+func (c *Client) Type() DatabaseType {
+	return c.dbType
 }
 
 // Query executes a query on the database with the given arguments and
