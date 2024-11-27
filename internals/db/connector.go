@@ -145,7 +145,7 @@ type DatabaseClient interface {
 	// represents a chunk of data and each map represents a row in the chunk.
 	// The size of each chunk is determined by the chunkSize parameter. If the
 	// query fails, an error is returned.
-	FetchChunks(ctx context.Context, query string, chunkSize int, args ...interface{}) ([][]map[string]interface{}, error)
+	FetchChunks(ctx context.Context, query string, chunkSize int, args ...interface{}) ([][]Row, error)
 
 	// Close closes the connection to the database.
 	Close() error

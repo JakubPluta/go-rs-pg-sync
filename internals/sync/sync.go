@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -22,8 +23,8 @@ const (
 type TableMapping struct {
 	SourceTable    string
 	TargetTable    string
-	ColumnsMapping map[string]string // source column -> target column e.g { "id": "id", "name": "big_name" }
-	ExcludeColumns []string          // columns to exclude
+	ColumnsMapping map[string]string // Optional source column -> target column e.g { "id": "id", "name": "big_name" }
+	ExcludeColumns []string          // Optional columns to exclude
 	BatchSize      int
 	Concurrency    int
 }
@@ -146,6 +147,195 @@ func (s *DatabaseSyncer) buildSourceQuery(tableMapping TableMapping) string {
 	return query
 }
 
+// buildTargetQuery constructs a SQL INSERT query for the target table based on the provided
+// table mapping and a chunk of data. It maps the source columns to the target columns, excludes
+// any columns specified in the ExcludeColumns list of the TableMapping, and prepares the
+// placeholders for the values.
+//
+// Parameters:
+//   - tableMapping: The mapping that specifies the source and target columns, and any columns
+//     to exclude from the query.
+//   - chunk: A slice of rows, where each row is a map of column names to values.
+//
+// Returns:
+// A tuple containing:
+//   - A SQL INSERT query string that inserts the mapped columns into the target table.
+//   - A slice of interface{} containing the values to be inserted, which correspond to the
+//     placeholders in the query.
+func (s *DatabaseSyncer) buildTargetQuery(tableMapping TableMapping, chunk []db.Row) (string, []interface{}) {
+	if len(chunk) == 0 {
+		// If the chunk is empty, return an empty query
+		return "", nil
+	}
+
+	// Prepare columns to insert
+	var columns []string
+	if len(tableMapping.ColumnsMapping) > 0 {
+		for _, targetCol := range tableMapping.ColumnsMapping {
+			if !contains(tableMapping.ExcludeColumns, targetCol) {
+				columns = append(columns, targetCol)
+			}
+		}
+	} else {
+		// If ColumnsMapping is nil, insert all columns
+		for col := range chunk[0] {
+			if !contains(tableMapping.ExcludeColumns, col) {
+				columns = append(columns, col)
+			}
+		}
+	}
+
+	// Prepare placeholders for values
+	valueStrings := make([]string, 0, len(chunk))
+	valueArgs := make([]interface{}, 0, len(chunk)*len(columns))
+
+	for i, row := range chunk {
+		// Prepare placeholders
+		placeholders := make([]string, len(columns))
+		for j, col := range columns {
+			valueArgs = append(valueArgs, row[col])
+			placeholders[j] = fmt.Sprintf("$%d", i*len(columns)+j+1)
+		}
+		valueStrings = append(valueStrings, fmt.Sprintf("(%s)", strings.Join(placeholders, ",")))
+	}
+
+	// Build query with insert placeholders
+	query := fmt.Sprintf(
+		"INSERT INTO %s (%s) VALUES %s",
+		tableMapping.TargetTable,
+		strings.Join(quoteIdentifiers(columns), ","),
+		strings.Join(valueStrings, ","),
+	)
+
+	return query, valueArgs
+}
+
+// SyncTable synchronizes data from a source table to a target table based on the provided
+// table mapping. It constructs queries to fetch data from the source and insert it into
+// the target, handling batch processing and concurrency.
+//
+// Parameters:
+//   - ctx: The context for managing request lifecycle and cancellation.
+//   - tableMapping: The mapping that specifies the source and target tables, column mappings,
+//     and other sync-specific settings.
+//
+// Returns:
+// An error if the synchronization process fails at any step, otherwise returns nil.
+//
+// The method logs the start and end of the table synchronization process, and updates sync
+// statistics, including processed rows, failed rows, and execution time. It also handles
+// retries for failed insert operations based on the configuration.
+func (s *DatabaseSyncer) SyncTable(ctx context.Context, tableMapping TableMapping) error {
+	s.logger.Printf("Syncing table: %s", tableMapping.TargetTable)
+
+	stats := &SyncStats{
+		StartTime: time.Now(),
+		TableName: tableMapping.TargetTable,
+	}
+
+	s.mu.Lock() // Lock mutex before updating stats
+	s.stats[tableMapping.TargetTable] = stats
+	s.mu.Unlock() // Unlock mutex after updating stats
+	// Set batch size
+	batchSize := tableMapping.BatchSize
+	if batchSize <= 0 {
+		batchSize = s.config.DefaultBatchSize
+	}
+	sourceQuery := s.buildSourceQuery(tableMapping)
+	s.logger.Printf("Source query: %s", sourceQuery)
+
+	// Fetch data from source
+	chunks, err := s.source.FetchChunks(ctx, sourceQuery, batchSize)
+	if err != nil {
+		return fmt.Errorf("failed to fetch data from source: %w", err)
+	}
+
+	// set up error channel
+	errChan := make(chan error, len(chunks))
+	var wg sync.WaitGroup
+
+	// define semaphore for max concurrency limit
+	semaphore := make(chan struct{}, tableMapping.Concurrency)
+
+	for i, chunk := range chunks {
+		wg.Add(1)               // Increment waitgroup counter
+		semaphore <- struct{}{} // Acquire semaphore
+		go func(chunkIdx int, dataChunk []db.Row) {
+			defer wg.Done()                // Decrement waitgroup counter
+			defer func() { <-semaphore }() // Release semaphore
+
+			startTime := time.Now()
+
+			query, args := s.buildTargetQuery(tableMapping, dataChunk)
+			s.logger.Printf("Target query: %s", query)
+			var insertErr error
+
+			for attempt := 0; attempt < s.config.RetryAttempts; attempt++ {
+				if attempt > 0 {
+					s.logger.Printf("Retrying after error: %v", insertErr)
+					time.Sleep(time.Duration(s.config.RetryDelay) * time.Second)
+				}
+
+				if _, err := s.target.Query(ctx, query, args...); err != nil {
+					s.mu.Lock() // Lock mutex before updating stats
+					stats.ProcessedRows += int64(len(dataChunk))
+					stats.BatchesProcessed++
+					stats.AverageBatchTime = (stats.AverageBatchTime*time.Duration(stats.BatchesProcessed-1) +
+						time.Since(startTime)) / time.Duration(stats.BatchesProcessed)
+					s.mu.Unlock()
+					return
+				} else {
+					insertErr = err
+					s.logger.Printf("Retry %d failed for chunk %d: %v", attempt+1, chunkIdx, err)
+				}
+			}
+			// if all retries failed, return error
+			s.mu.Lock() // Lock mutex before updating stats
+			stats.FailedRows += int64(len(dataChunk))
+			stats.BatchesFailed++
+			s.mu.Unlock()
+			errChan <- fmt.Errorf("failed to insert chunk %d: %w", chunkIdx, insertErr)
+		}(i, chunk)
+
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// collect errors
+	var errors []error
+	for err := range errChan {
+		errors = append(errors, err)
+	}
+	s.mu.Lock()
+	stats.EndTime = time.Now()
+	stats.TotalExecutionTime = stats.EndTime.Sub(stats.StartTime)
+	s.mu.Unlock()
+	if len(errors) > 0 {
+		return fmt.Errorf("sync completed with %d errors: %v", len(errors), errors)
+	}
+
+	s.logger.Printf("Successfully synced table %s -> %s. Stats: %+v",
+		tableMapping.SourceTable, tableMapping.TargetTable, stats)
+	return nil
+
+}
+
+// Sync synchronizes data between the source and target databases based on the configuration.
+//
+// It iterates over the configured table mappings and calls SyncTable for each mapping.
+// If any of the calls to SyncTable fail, an error is returned.
+//
+// The function returns an error if any of the table syncs fail. Otherwise, it returns nil.
+func (s *DatabaseSyncer) Sync(ctx context.Context) error {
+	for _, mapping := range s.config.Tables {
+		if err := s.SyncTable(ctx, mapping); err != nil {
+			return fmt.Errorf("failed to sync table %s: %w", mapping.SourceTable, err)
+		}
+	}
+	return nil
+}
+
 // Helper functions
 
 // quoteIdentifiers takes a slice of string identifiers and returns a new slice
@@ -175,25 +365,4 @@ func contains(slice []string, str string) bool {
 		}
 	}
 	return false
-}
-
-// join takes a slice of strings and joins them together with the given separator string.
-//
-// If the slice is empty, an empty string is returned.
-//
-// Parameters:
-//   - slice: The slice of strings to join
-//   - sep: The separator string to use when joining the strings
-//
-// Returns:
-// The joined string
-func join(slice []string, sep string) string {
-	if len(slice) == 0 {
-		return ""
-	}
-	result := slice[0]
-	for _, s := range slice[1:] {
-		result += sep + s
-	}
-	return result
 }
