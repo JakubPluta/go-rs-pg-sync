@@ -1,48 +1,35 @@
 package main
 
 import (
-	"context"
-	"fmt"
 	"log"
-	"time"
 
 	"github.com/JakubPluta/go-rs-pg-sync/internals/db"
 )
 
 func main() {
-	// TODO: implement
+	// PostgreSQL
+	pgConfig := db.NewDefaultConfig(db.TypePostgres)
+	pgConfig.Host = "localhost"
+	pgConfig.Database = "mydb"
+	pgConfig.User = "user"
+	pgConfig.Password = "pass"
 
-	cfg := &db.Config{
-		Host:         "localhost",
-		Port:         5439,
-		User:         "username",
-		Password:     "password",
-		Database:     "database",
-		SSLMode:      "disable",
-		MaxOpenConns: 10,
-		MaxIdleConns: 5,
-		ConnTimeout:  5 * time.Second,
-	}
-
-	client, err := db.NewRedshiftDatabaseClient(cfg, nil)
+	pgClient, err := db.NewClient(pgConfig, nil)
 	if err != nil {
 		log.Fatal(err)
-		// handle error
-		return
 	}
-	defer client.Close()
+	defer pgClient.Close()
 
-	rows, err := client.FetchChunks(context.Background(), "SELECT * FROM table.table limit", 100)
+	// Redshift
+	rsConfig := db.NewDefaultConfig(db.TypeRedshift)
+	rsConfig.Host = "redshift-cluster.amazonaws.com"
+	rsConfig.Database = "warehouse"
+	rsConfig.User = "admin"
+	rsConfig.Password = "pass"
+
+	rsClient, err := db.NewClient(rsConfig, nil)
 	if err != nil {
 		log.Fatal(err)
-		// handle error
-		return
 	}
-
-	for _, chunk := range rows {
-		for idx, row := range chunk {
-			fmt.Println(idx, row)
-		}
-	}
-
+	defer rsClient.Close()
 }

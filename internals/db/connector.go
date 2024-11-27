@@ -54,7 +54,7 @@ type Config struct {
 }
 
 // NewDefaultConfig creates a new Config instance with default values.
-// These values can be overridden before passing to NewRedshiftClient.
+// These values can be overridden before passing to the NewClient function.
 //
 // Default values:
 // - Port: 5439
@@ -159,9 +159,7 @@ type DatabaseClient interface {
 	Type() DatabaseType
 }
 
-// RedshiftDatabaseClient implements the DatabaseClient interface for a Redshift database.
-// It provides methods to query the database, fetch chunks of data, close the connection
-// and ping the connection.
+// Client implements the DatabaseClient interface
 type Client struct {
 	db         *sql.DB
 	logger     *log.Logger
@@ -173,17 +171,14 @@ func (c *Client) Type() DatabaseType {
 	return c.dbType
 }
 
-// Query executes a query on the database with the given arguments and
-// returns the result as a *sql.Rows. sql.Rows its cursor starts before
-// the first row. If the query fails, an error is returned.
-func (r *RedshiftDatabaseClient) Query(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
-	if r.db == nil {
+func (c *Client) Query(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	if c.db == nil {
 		// Return an error if the database connection is nil. It can happen if the database client is closed
 		return nil, ErrNilConnection
 	}
 
-	r.logger.Printf("executing query: %s with args: %v", query, args)
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	c.logger.Printf("executing query: %s with args: %v", query, args)
+	rows, err := c.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		// Return an error if the query fails
 		return nil, fmt.Errorf("failed to execute query: %w", err)
@@ -195,11 +190,11 @@ func (r *RedshiftDatabaseClient) Query(ctx context.Context, query string, args .
 // FetchChunks executes a query on the database with the given arguments and
 // returns the result as a slice of slices of maps. Each inner slice represents a chunk of data and each map represents a row in the chunk.
 // The size of each chunk is determined by the chunkSize parameter. If the query fails, an error is returned.
-func (r *RedshiftDatabaseClient) FetchChunks(ctx context.Context, query string, chunkSize int, args ...interface{}) ([][]Row, error) {
+func (c *Client) FetchChunks(ctx context.Context, query string, chunkSize int, args ...interface{}) ([][]Row, error) {
 	if chunkSize <= 0 {
 		return nil, ErrInvalidChunkSize
 	}
-	rows, err := r.Query(ctx, query, args...)
+	rows, err := c.Query(ctx, query, args...)
 	if err != nil {
 		// Return an error if the query fails
 		return nil, err
@@ -240,7 +235,7 @@ func (r *RedshiftDatabaseClient) FetchChunks(ctx context.Context, query string, 
 		// create map for the rows
 		row := make(Row, len(columns))
 		for i, col := range columns {
-			row[col] = convertValueToGoType(values[i]) // convert value to go type
+			row[col] = convertValueType(values[i]) // convert value to go type
 		}
 		// add row to chunk
 		chunk = append(chunk, row)
@@ -265,14 +260,16 @@ func (r *RedshiftDatabaseClient) FetchChunks(ctx context.Context, query string, 
 
 }
 
-// Close closes the connection to the Redshift database.
-// If the database connection is nil, it returns ErrNilConnection.
-// Otherwise, it attempts to close the connection and returns any error encountered.
-func (r *RedshiftDatabaseClient) Close() error {
-	if r.db == nil {
+func (c *Client) Close() error {
+	if c.db == nil {
 		return ErrNilConnection
 	}
-	return r.db.Close()
+	// Close all prepared statements. It's important to do this before closing the connection
+	for _, stmt := range c.statements {
+		stmt.Close()
+	}
+
+	return c.db.Close()
 }
 
 // Ping checks if the connection to the database is still alive,
@@ -280,22 +277,21 @@ func (r *RedshiftDatabaseClient) Close() error {
 // the method returns nil. Otherwise, an error is returned.
 //
 // If the database connection is nil, it returns ErrNilConnection.
-func (r *RedshiftDatabaseClient) Ping(ctx context.Context) error {
-	if r.db == nil {
+func (c *Client) Ping(ctx context.Context) error {
+	if c.db == nil {
 		return ErrNilConnection
 	}
-	return r.db.PingContext(ctx)
+	return c.db.PingContext(ctx)
 }
 
-// NewRedshiftDatabaseClient creates a new RedshiftDatabaseClient based on the given configuration.
-// If the configuration is invalid, or if the connection can't be established,
-// an error is returned. If the connection is established, but the database can't
-// be pinged, the connection is closed and an error is returned.
-//
-// If the logger is nil, the package's default logger is used.
-func NewRedshiftDatabaseClient(cfg *Config, logger *log.Logger) (*RedshiftDatabaseClient, error) {
+// NewClient creates a new instance of the Client type based on the given configuration.
+// It creates a connection to the database and verifies it by pinging it.
+// If the configuration is invalid, the connection can't be established or the ping fails,
+// it returns an error. Otherwise, it returns a new instance of the Client type.
+func NewClient(cfg *Config, logger *log.Logger) (*Client, error) {
 	if logger == nil {
-		logger = log.New(log.Writer(), "[REDSHIFT] ", log.LstdFlags)
+		prefix := fmt.Sprintf("[%s] ", cfg.Type)
+		logger = log.New(log.Writer(), prefix, log.LstdFlags)
 	}
 	if err := cfg.Validate(); err != nil {
 		// If the configuration is invalid, return an error
@@ -311,7 +307,7 @@ func NewRedshiftDatabaseClient(cfg *Config, logger *log.Logger) (*RedshiftDataba
 	db.SetMaxIdleConns(cfg.MaxIdleConns)
 	db.SetConnMaxLifetime(cfg.ConnTimeout)
 
-	client := &RedshiftDatabaseClient{db: db, logger: logger}
+	client := &Client{db: db, logger: logger, dbType: cfg.Type, statements: make(map[string]*sql.Stmt)}
 
 	// verify connection
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ConnTimeout)
@@ -319,7 +315,7 @@ func NewRedshiftDatabaseClient(cfg *Config, logger *log.Logger) (*RedshiftDataba
 	if err := client.Ping(ctx); err != nil {
 		// If the connection can't be pinged, close the connection and return an error
 		client.Close()
-		return nil, fmt.Errorf("failed to ping Redshift: %v", err)
+		return nil, fmt.Errorf("failed to ping client: %v", err)
 	}
 
 	return client, nil
@@ -329,7 +325,7 @@ func NewRedshiftDatabaseClient(cfg *Config, logger *log.Logger) (*RedshiftDataba
 // convertValueToGoType takes a value of unknown type and attempts to convert it
 // to a native Go type. If the type is a []byte, it is converted to a string.
 // Otherwise, the original value is returned.
-func convertValueToGoType(v interface{}) interface{} {
+func convertValueType(v interface{}) interface{} {
 	switch val := v.(type) {
 	case []byte:
 		return string(val)
